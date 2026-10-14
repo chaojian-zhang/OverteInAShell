@@ -1,4 +1,5 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+filterwarnings = ["ignore:connect\\(\\) must be used as a context manager:DeprecationWarning"]
 markers = ["overte: needs a running local Overte domain (see scripts/run_local_domain.sh)"]

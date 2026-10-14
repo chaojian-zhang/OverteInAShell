@@ -17,8 +17,10 @@ except ImportError:  # imported outside Blender (unit tests): pure modules still
 
 
 def register():
-    pass
+    from . import ui
+    ui.register()
 
 
 def unregister():
-    pass
+    from . import ui
+    ui.unregister()
