@@ -36,6 +36,8 @@ jobs:
           # Unpack instead of installing: the package's postinst would start
           # system services on the runner.
           sudo dpkg-deb -x "$OVERTE_DEB" /
+          # What postinst would do: create the versioned library links (libnode.so.127, ...)
+          sudo ldconfig -n /opt/overte/lib
           deps=$(dpkg-deb -f "$OVERTE_DEB" Depends | sed 's/([^)]*)//g; s/,/ /g')
           sudo apt-get update -qq
           sudo apt-get install -y -qq $deps
