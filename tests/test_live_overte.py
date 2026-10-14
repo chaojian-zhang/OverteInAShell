@@ -171,7 +171,6 @@ def test_add_entity_from_blender(overte_env):
 
 def test_duplicate_in_blender_clones_entity(overte_env):
     env = overte_env
-    bpy = env["bpy"]
     crate = obj_for(env, SHARED["box"])
     dup = crate.copy()  # what Shift+D does: same custom props, so same overte_id
     dup.location.x += 10

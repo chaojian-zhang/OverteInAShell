@@ -40,20 +40,43 @@ def pump(s, cond, timeout=5):
     raise AssertionError("timeout")
 
 
-def test_bridge_script_is_served_with_ws_url():
-    s = LinkSession(FakeSync(), "127.0.0.1", 0, log=lambda m: None)
+def test_bridge_script_is_served_with_ws_url_and_token():
+    s = LinkSession(FakeSync(), "127.0.0.1", 0, log=lambda m: None, token="s3cret")
     s.start()
     try:
+        assert s.bridge_url().endswith("/overte_bridge.js?token=s3cret")
         js = urllib.request.urlopen(s.bridge_url(), timeout=5).read().decode()
-        assert f'var WS_URL = "ws://127.0.0.1:{s.port}/ws";' in js
+        assert f'var WS_URL = "ws://127.0.0.1:{s.port}/ws?token=s3cret";' in js
         assert "__OVERTE_LIVE_LINK_WS_URL__" not in js
+    finally:
+        s.stop()
+
+
+def test_token_is_enforced():
+    import pytest
+    from websockets.exceptions import InvalidStatus
+
+    sync = FakeSync()
+    s = LinkSession(sync, "127.0.0.1", 0, log=lambda m: None)  # generated token
+    s.start()
+    try:
+        assert len(s.token) >= 16
+        for bad in ("", "?token=nope"):
+            with pytest.raises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(f"http://127.0.0.1:{s.port}/overte_bridge.js{bad}", timeout=5)
+            assert err.value.code == 403
+            with pytest.raises(InvalidStatus):
+                connect(f"ws://127.0.0.1:{s.port}/ws{bad}")
+        with connect(f"ws://127.0.0.1:{s.port}/ws?token={s.token}") as ws:
+            ws.send(json.dumps({"type": "hello", "version": 1}))
+            pump(s, lambda: sync.connected)
     finally:
         s.stop()
 
 
 def test_active_and_standby_bridges():
     sync = FakeSync()
-    s = LinkSession(sync, "127.0.0.1", 0, log=lambda m: None)
+    s = LinkSession(sync, "127.0.0.1", 0, log=lambda m: None, token="")
     s.start()
     url = f"ws://127.0.0.1:{s.port}/ws"
     try:
@@ -88,7 +111,7 @@ def test_active_and_standby_bridges():
 
 def test_request_reply_and_binary():
     sync = FakeSync()
-    s = LinkSession(sync, "127.0.0.1", 0, log=lambda m: None)
+    s = LinkSession(sync, "127.0.0.1", 0, log=lambda m: None, token="")
     s.start()
     try:
         ws = connect(f"ws://127.0.0.1:{s.port}/ws")

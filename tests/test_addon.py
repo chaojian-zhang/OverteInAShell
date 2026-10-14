@@ -76,3 +76,50 @@ def test_glb_export_import_roundtrip(addon):
     assert size2 == pytest.approx((1, 2, 3), abs=1e-5)
     assert center2 == pytest.approx((0, 0, 5), abs=1e-5)
     assert len(bpy.data.objects) == n_objects and len(bpy.data.scenes) == 1
+
+
+def test_dirty_tracking_finds_changes(addon):
+    sync = ss.SceneSync(bpy.context.scene, log=lambda m: None)
+    col = ss.overte_collection(bpy.context.scene)
+    objs = []
+    for i in range(100):
+        o = bpy.data.objects.new(f"B{i}", ss.unit_mesh("Cube"))
+        o.material_slots[0].link = "OBJECT"
+        o[ss.P_ID] = "{%08d-0000-0000-0000-000000000000}" % i
+        o[ss.P_TYPE] = "Box"
+        col.objects.link(o)
+        objs.append(o)
+    bpy.context.view_layer.update()
+    for o in objs:
+        rec = ss.Record(ss.norm_id(o[ss.P_ID]), "Box", o.name)
+        rec.local = sync.local_fields(o, "Box")
+        sync.records[rec.id] = rec
+    sync.synced = True
+    sync.track_dirty = True
+
+    def handler(scene, depsgraph):
+        sync.on_depsgraph_update(depsgraph)
+
+    bpy.app.handlers.depsgraph_update_post.append(handler)
+    try:
+        assert sync.collect_outgoing() == []
+        objs[42].location.z = 3
+        bpy.context.view_layer.update()
+        out = sync.collect_outgoing()
+        assert [e["id"] for e in out[0]["edits"]] == [ss.norm_id(objs[42][ss.P_ID])]
+        # Colour change through the material (a data-level update).
+        ss._set_object_color(objs[7], (0, 0, 1))
+        bpy.context.view_layer.update()
+        out = sync.collect_outgoing()
+        assert out and out[0]["edits"][0]["props"].get("color") == {"red": 0, "green": 0, "blue": 255}
+    finally:
+        bpy.app.handlers.depsgraph_update_post.remove(handler)
+
+    # A change the handler never saw is still found by the round-robin scan.
+    objs[99].location.x = 5
+    bpy.context.view_layer.update()
+    found = []
+    for _ in range(sync.SCAN_TICKS + 1):
+        for msg in sync.collect_outgoing():
+            found += [e["id"] for e in msg.get("edits", [])]
+    assert ss.norm_id(objs[99][ss.P_ID]) in found

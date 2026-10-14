@@ -1,7 +1,5 @@
 """Sidebar panel, settings and operators."""
 
-from __future__ import annotations
-
 import uuid
 
 import bpy
@@ -12,6 +10,16 @@ from . import scene_sync as ss
 
 
 # ------------------------------------------------------------- settings
+def _live_update(self, context):
+    """Apply changed settings to a running session."""
+    s = runtime.session
+    if s is None:
+        return
+    s.sync.sync_deletes = self.sync_deletes
+    s.sync.models.auto_load = self.auto_load_models
+    s.sync.models.auto_update = self.auto_update_models
+
+
 class OverteLinkSettings(bpy.types.PropertyGroup):
     host: StringProperty(
         name="Listen address", default="127.0.0.1",
@@ -20,14 +28,18 @@ class OverteLinkSettings(bpy.types.PropertyGroup):
     port: IntProperty(name="Port", default=9420, min=0, max=65535,
                       description="TCP port for the link (0 picks any free port)")
     sync_deletes: BoolProperty(
-        name="Sync deletions", default=True,
+        name="Sync deletions", default=True, update=_live_update,
         description="Deleting a linked object in Blender deletes its entity in Overte")
     auto_load_models: BoolProperty(
-        name="Load model geometry", default=True,
+        name="Load model geometry", default=True, update=_live_update,
         description="Download and show the geometry of Model entities (otherwise they stay as boxes)")
     auto_update_models: BoolProperty(
-        name="Re-upload edited models", default=True,
+        name="Re-upload edited models", default=True, update=_live_update,
         description="When a mesh published from Blender is edited, upload the new version automatically")
+    token: StringProperty(
+        name="Access token", default="",
+        description="Secret the bridge must present. Saved with the .blend so the URL in your "
+                    "domain settings keeps working; generated on first start")
 
 
 def _settings(context) -> OverteLinkSettings:
@@ -47,9 +59,12 @@ class OVERTE_OT_start(bpy.types.Operator):
 
     def execute(self, context):
         st = _settings(context)
+        if not st.token:
+            from .session import new_token
+            st.token = new_token()
         try:
             runtime.start(context.scene, st.host, st.port, st.sync_deletes,
-                          st.auto_load_models, st.auto_update_models)
+                          st.auto_load_models, st.auto_update_models, token=st.token)
         except OSError as exc:
             self.report({"ERROR"}, f"Cannot listen on {st.host}:{st.port}: {exc}")
             return {"CANCELLED"}
@@ -80,6 +95,18 @@ class OVERTE_OT_copy_bridge_url(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class OVERTE_OT_new_token(bpy.types.Operator):
+    bl_idname = "overte.new_token"
+    bl_label = "New Access Token"
+    bl_description = ("Replace the access token. Bridges using the old URL can no longer connect; "
+                      "update the URL in your domain settings")
+
+    def execute(self, context):
+        from .session import new_token
+        _settings(context).token = new_token()
+        return {"FINISHED"}
+
+
 class OVERTE_OT_save_bridge(bpy.types.Operator):
     bl_idname = "overte.save_bridge"
     bl_label = "Save Bridge Script…"
@@ -95,9 +122,11 @@ class OVERTE_OT_save_bridge(bpy.types.Operator):
 
     def execute(self, context):
         from .session import bridge_script
-        port = runtime.session.port if runtime.session else _settings(context).port
+        st = _settings(context)
+        port = runtime.session.port if runtime.session else st.port
+        q = f"?token={st.token}" if st.token else ""
         with open(bpy.path.abspath(self.filepath), "w", encoding="utf-8") as f:
-            f.write(bridge_script(f"ws://{self.ws_host}:{port}/ws"))
+            f.write(bridge_script(f"ws://{self.ws_host}:{port}/ws{q}"))
         self.report({"INFO"}, f"Saved {self.filepath}")
         return {"FINISHED"}
 
@@ -311,11 +340,18 @@ class OVERTE_PT_link(bpy.types.Panel):
             layout.prop(st, "sync_deletes")
             layout.prop(st, "auto_load_models")
             layout.prop(st, "auto_update_models")
+            row = layout.row(align=True)
+            row.label(text="Token: " + (st.token or "(generated on start)"))
+            row.operator(OVERTE_OT_new_token.bl_idname, text="", icon="FILE_REFRESH")
             layout.operator(OVERTE_OT_start.bl_idname, icon="PLAY")
         else:
             row = layout.row()
             row.label(text=f"Listening on {s.server.host}:{s.port}", icon="LINKED")
             row.operator(OVERTE_OT_stop.bl_idname, text="", icon="PAUSE")
+            col = layout.column(align=True)
+            col.prop(st, "sync_deletes")
+            col.prop(st, "auto_load_models")
+            col.prop(st, "auto_update_models")
             info = s.bridge_info
             box = layout.box()
             if info is None:
@@ -340,7 +376,7 @@ class OVERTE_PT_link(bpy.types.Panel):
                     box.label(text=f"Transferring {sync.models.in_flight} model(s)…", icon="SORTTIME")
                 row = box.row(align=True)
                 row.operator(OVERTE_OT_resync.bl_idname, icon="FILE_REFRESH")
-                row.operator(OVERTE_OT_publish.bl_idname, icon="EXPORT")
+                row.operator(OVERTE_OT_publish.bl_idname, text="Publish", icon="EXPORT")
                 if sync.missing_ids:
                     b2 = layout.box()
                     b2.label(text=f"{len(sync.missing_ids)} linked object(s) not in domain", icon="ERROR")
@@ -381,7 +417,7 @@ class OVERTE_PT_entity(bpy.types.Panel):
             layout.prop(obj, f'["{ss.P_TEXT}"]', text="Text")
         if etype == "Model" and obj.get(ss.P_ID):
             row = layout.row(align=True)
-            row.operator(OVERTE_OT_load_model.bl_idname, icon="IMPORT")
+            row.operator(OVERTE_OT_load_model.bl_idname, text="Load Model", icon="IMPORT")
             if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
                 row.operator(OVERTE_OT_publish.bl_idname, text="Re-upload", icon="EXPORT")
         layout.prop(obj, "hide_render", text="Hidden in Overte", toggle=False)
@@ -398,7 +434,7 @@ def _object_menu(self, context):
 
 CLASSES = (
     OverteLinkSettings,
-    OVERTE_OT_start, OVERTE_OT_stop, OVERTE_OT_copy_bridge_url, OVERTE_OT_save_bridge,
+    OVERTE_OT_start, OVERTE_OT_stop, OVERTE_OT_copy_bridge_url, OVERTE_OT_new_token, OVERTE_OT_save_bridge,
     OVERTE_OT_resync, OVERTE_OT_add_entity, OVERTE_OT_publish, OVERTE_OT_load_model, OVERTE_OT_unlink, OVERTE_OT_recreate_missing,
     OVERTE_OT_select_missing, OVERTE_MT_add, OVERTE_PT_link, OVERTE_PT_entity,
 )
