@@ -54,7 +54,8 @@ PY
     fi
     sleep 1
   done
-  echo "domain-server did not come up; see $RUN_DIR/domain-server.log" >&2
+  echo "domain-server did not come up. Last log lines:" >&2
+  tail -n 30 "$RUN_DIR/domain-server.log" "$RUN_DIR/assignment-client.log" >&2 || true
   exit 1
 }
 

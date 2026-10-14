@@ -81,8 +81,11 @@ class Probe:
 
 
 def _launcher(*args, env):
-    return subprocess.run([os.path.join(ROOT, "scripts", "run_local_domain.sh"), *args],
-                          env=env, check=True, capture_output=True, text=True, cwd=ROOT)
+    r = subprocess.run([os.path.join(ROOT, "scripts", "run_local_domain.sh"), *args],
+                       env=env, capture_output=True, text=True, cwd=ROOT)
+    if r.returncode != 0:
+        raise RuntimeError(f"run_local_domain.sh {args[0]} failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
+    return r
 
 
 @pytest.fixture(scope="module")
@@ -104,8 +107,8 @@ def overte_env(tmp_path_factory):
 
     home = tmp_path_factory.mktemp("overte-domain")
     env = dict(os.environ, DOMAIN_HOME=str(home), FRESH="1", OVERTE_DIR=OVERTE_DIR)
-    _launcher("start", session.bridge_url(), probe.url(), env=env)
     try:
+        _launcher("start", session.bridge_url(), probe.url(), env=env)
         probe.wait_connected()
         end = time.time() + 90
         while time.time() < end and not sync.synced:
@@ -119,5 +122,5 @@ def overte_env(tmp_path_factory):
         finally:
             session.stop()
             probe.stop()
-            if os.environ.get("KEEP_OVERTE_LOGS"):
+            if os.environ.get("KEEP_OVERTE_LOGS") and (home / "run").exists():
                 shutil.copytree(home / "run", os.path.join(ROOT, ".overte-test-logs"), dirs_exist_ok=True)

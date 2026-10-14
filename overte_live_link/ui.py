@@ -17,7 +17,8 @@ class OverteLinkSettings(bpy.types.PropertyGroup):
         name="Listen address", default="127.0.0.1",
         description="Address the link server binds to. Use 0.0.0.0 when the Overte domain "
                     "runs on another machine and must connect to this computer")
-    port: IntProperty(name="Port", default=9420, min=1, max=65535)
+    port: IntProperty(name="Port", default=9420, min=0, max=65535,
+                      description="TCP port for the link (0 picks any free port)")
     sync_deletes: BoolProperty(
         name="Sync deletions", default=True,
         description="Deleting a linked object in Blender deletes its entity in Overte")
