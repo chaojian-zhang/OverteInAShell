@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["overte: needs a running local Overte domain (see scripts/run_local_domain.sh)"]

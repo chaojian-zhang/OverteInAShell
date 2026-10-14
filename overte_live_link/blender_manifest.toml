@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "overte_live_link"
+version = "0.1.0"
+name = "Overte Live Link"
+tagline = "Edit an Overte domain's entities live from Blender"
+maintainer = "OverteInAShell contributors"
+type = "add-on"
+website = "https://github.com/chaojian-zhang/OverteInAShell"
+tags = ["3D View", "Import-Export"]
+
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Runs a local WebSocket/HTTP server the Overte bridge script connects to"
+files = "Exports meshes to temporary glTF files for upload to the Overte asset server"

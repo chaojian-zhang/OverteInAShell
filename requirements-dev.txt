@@ -1,0 +1,4 @@
+# Test-only dependencies. The add-on itself needs nothing beyond Blender.
+bpy==5.2.2
+websockets>=13
+pytest>=8
