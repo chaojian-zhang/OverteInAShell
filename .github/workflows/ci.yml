@@ -17,3 +17,35 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Unit tests
         run: pytest -q -m "not overte"
+
+  overte:
+    # End-to-end against a real Overte server: the bridge runs as a domain
+    # persistent script and syncs with a headless Blender (bpy) session.
+    runs-on: ubuntu-24.04
+    env:
+      OVERTE_VERSION: "2026.04.1"
+      OVERTE_DEB: overte-server_2026.04.1-f91d15a-ubuntu-24.04-1_amd64.deb
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install Overte server
+        run: |
+          curl -sSfLO "https://public.overte.org/build/overte/release/$OVERTE_VERSION/$OVERTE_DEB"
+          # Unpack instead of installing: the package's postinst would start
+          # system services on the runner.
+          sudo dpkg-deb -x "$OVERTE_DEB" /
+          deps=$(dpkg-deb -f "$OVERTE_DEB" Depends | sed 's/([^)]*)//g; s/,/ /g')
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq $deps
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Integration tests
+        run: KEEP_OVERTE_LOGS=1 pytest -q -m overte
+      - name: Upload Overte logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: overte-logs
+          path: .overte-test-logs/
