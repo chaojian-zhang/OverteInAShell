@@ -22,6 +22,12 @@ class OverteLinkSettings(bpy.types.PropertyGroup):
     sync_deletes: BoolProperty(
         name="Sync deletions", default=True,
         description="Deleting a linked object in Blender deletes its entity in Overte")
+    auto_load_models: BoolProperty(
+        name="Load model geometry", default=True,
+        description="Download and show the geometry of Model entities (otherwise they stay as boxes)")
+    auto_update_models: BoolProperty(
+        name="Re-upload edited models", default=True,
+        description="When a mesh published from Blender is edited, upload the new version automatically")
 
 
 def _settings(context) -> OverteLinkSettings:
@@ -42,7 +48,8 @@ class OVERTE_OT_start(bpy.types.Operator):
     def execute(self, context):
         st = _settings(context)
         try:
-            runtime.start(context.scene, st.host, st.port, st.sync_deletes)
+            runtime.start(context.scene, st.host, st.port, st.sync_deletes,
+                          st.auto_load_models, st.auto_update_models)
         except OSError as exc:
             self.report({"ERROR"}, f"Cannot listen on {st.host}:{st.port}: {exc}")
             return {"CANCELLED"}
@@ -183,6 +190,47 @@ class OVERTE_OT_add_entity(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class OVERTE_OT_publish(bpy.types.Operator):
+    bl_idname = "overte.publish"
+    bl_label = "Publish to Overte"
+    bl_description = ("Upload the selected meshes to the domain's asset server as Model entities "
+                      "(or update them), and add selected lights as Light entities")
+
+    @classmethod
+    def poll(cls, context):
+        return (runtime.session is not None and runtime.session.bridge_info is not None
+                and bool(context.selected_objects))
+
+    def execute(self, context):
+        n, errors = runtime.session.sync.models.publish(context.selected_objects)
+        for e in errors:
+            self.report({"WARNING"}, e)
+        if n:
+            self.report({"INFO"}, f"Publishing {n} object(s)")
+        return {"FINISHED"} if n else {"CANCELLED"}
+
+
+class OVERTE_OT_load_model(bpy.types.Operator):
+    bl_idname = "overte.load_model"
+    bl_label = "Load Model Geometry"
+    bl_description = "Download the selected Model entities' models and show their geometry"
+
+    @classmethod
+    def poll(cls, context):
+        return runtime.session is not None and any(
+            o.get(ss.P_TYPE) == "Model" and o.get(ss.P_URL) and o.get(ss.P_ID) for o in context.selected_objects)
+
+    def execute(self, context):
+        models = runtime.session.sync.models
+        n = 0
+        for o in context.selected_objects:
+            if o.get(ss.P_TYPE) == "Model" and o.get(ss.P_URL) and o.get(ss.P_ID):
+                models.load(o, str(o[ss.P_URL]))
+                n += 1
+        self.report({"INFO"}, f"Loading {n} model(s)")
+        return {"FINISHED"}
+
+
 class OVERTE_OT_unlink(bpy.types.Operator):
     bl_idname = "overte.unlink"
     bl_label = "Unlink"
@@ -261,6 +309,8 @@ class OVERTE_PT_link(bpy.types.Panel):
             col.prop(st, "host")
             col.prop(st, "port")
             layout.prop(st, "sync_deletes")
+            layout.prop(st, "auto_load_models")
+            layout.prop(st, "auto_update_models")
             layout.operator(OVERTE_OT_start.bl_idname, icon="PLAY")
         else:
             row = layout.row()
@@ -286,8 +336,11 @@ class OVERTE_PT_link(bpy.types.Panel):
                     box.label(text="Loading entities…", icon="TIME")
                 else:
                     box.label(text=f"{len(sync.records)} entities linked")
+                if sync.models.in_flight:
+                    box.label(text=f"Transferring {sync.models.in_flight} model(s)…", icon="SORTTIME")
                 row = box.row(align=True)
                 row.operator(OVERTE_OT_resync.bl_idname, icon="FILE_REFRESH")
+                row.operator(OVERTE_OT_publish.bl_idname, icon="EXPORT")
                 if sync.missing_ids:
                     b2 = layout.box()
                     b2.label(text=f"{len(sync.missing_ids)} linked object(s) not in domain", icon="ERROR")
@@ -326,6 +379,11 @@ class OVERTE_PT_entity(bpy.types.Panel):
             layout.prop(obj, f'["{ss.P_URL}"]', text="Model URL")
         if ss.P_TEXT in obj:
             layout.prop(obj, f'["{ss.P_TEXT}"]', text="Text")
+        if etype == "Model" and obj.get(ss.P_ID):
+            row = layout.row(align=True)
+            row.operator(OVERTE_OT_load_model.bl_idname, icon="IMPORT")
+            if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
+                row.operator(OVERTE_OT_publish.bl_idname, text="Re-upload", icon="EXPORT")
         layout.prop(obj, "hide_render", text="Hidden in Overte", toggle=False)
         layout.operator(OVERTE_OT_unlink.bl_idname, icon="UNLINKED")
 
@@ -334,10 +392,14 @@ def _add_menu(self, context):
     self.layout.menu(OVERTE_MT_add.bl_idname, icon="WORLD")
 
 
+def _object_menu(self, context):
+    self.layout.operator(OVERTE_OT_publish.bl_idname, icon="WORLD")
+
+
 CLASSES = (
     OverteLinkSettings,
     OVERTE_OT_start, OVERTE_OT_stop, OVERTE_OT_copy_bridge_url, OVERTE_OT_save_bridge,
-    OVERTE_OT_resync, OVERTE_OT_add_entity, OVERTE_OT_unlink, OVERTE_OT_recreate_missing,
+    OVERTE_OT_resync, OVERTE_OT_add_entity, OVERTE_OT_publish, OVERTE_OT_load_model, OVERTE_OT_unlink, OVERTE_OT_recreate_missing,
     OVERTE_OT_select_missing, OVERTE_MT_add, OVERTE_PT_link, OVERTE_PT_entity,
 )
 
@@ -347,13 +409,18 @@ def register():
         bpy.utils.register_class(c)
     bpy.types.Scene.overte_link = PointerProperty(type=OverteLinkSettings)
     bpy.types.VIEW3D_MT_add.append(_add_menu)
+    bpy.types.VIEW3D_MT_object.append(_object_menu)
     bpy.app.handlers.load_pre.append(runtime._on_load_pre)
+    bpy.app.handlers.depsgraph_update_post.append(runtime._on_depsgraph_update)
 
 
 def unregister():
     runtime.stop()
     if runtime._on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(runtime._on_load_pre)
+    if runtime._on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(runtime._on_depsgraph_update)
+    bpy.types.VIEW3D_MT_object.remove(_object_menu)
     bpy.types.VIEW3D_MT_add.remove(_add_menu)
     del bpy.types.Scene.overte_link
     for c in reversed(CLASSES):

@@ -40,6 +40,8 @@ class LinkSession:
         self._await_binary: Optional[tuple] = None  # (callback, header) for "fetched"
         self.last_error = ""
         self.started_at = 0.0
+        if hasattr(sync, "attach"):
+            sync.attach(self)
 
     # ---------------------------------------------------------- lifecycle
     def start(self) -> int:

@@ -122,3 +122,16 @@ def test_quat_close_tolerates_overte_quantization():
                       "z": -0.0000152587890625, "w": 1})
     assert cv.quat_close(q, cv.IDENTITY)
     assert not cv.quat_close(axis_angle((0, 0, 1), 1.0), cv.IDENTITY)
+
+
+def test_registration_point_roundtrip():
+    rng = random.Random(5)
+    for _ in range(50):
+        rot = rand_quat(rng)
+        dims = [rng.uniform(0.1, 5) for _ in range(3)]
+        reg = [rng.uniform(0, 1) for _ in range(3)]
+        pos = [rng.uniform(-10, 10) for _ in range(3)]
+        c = cv.position_to_center(pos, rot, dims, reg)
+        approx(cv.center_to_position(c, rot, dims, reg), pos)
+    # Bottom-anchored 2 m tall box at y=0 has its centre 1 m up.
+    approx(cv.position_to_center((0, 0, 0), cv.IDENTITY, (1, 2, 1), (0.5, 0, 0.5)), (0, 1, 0))

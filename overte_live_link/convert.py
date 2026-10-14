@@ -187,6 +187,28 @@ def entity_to_object(props: dict,
     return loc, rot, scale  # type: ignore[return-value]
 
 
+# ------------------------------------------------------ registration point
+def registration_offset(rotation: Quat, dimensions: Sequence[float], registration: Sequence[float]) -> Vec3:
+    """World offset from an entity's ``position`` (its registration point) to its box centre.
+
+    ``registrationPoint`` is in 0..1 box coordinates; the default 0.5 means
+    ``position`` already is the centre. Everything in this add-on works with
+    centres and converts at the boundary.
+    """
+    local = tuple((0.5 - float(registration[i])) * float(dimensions[i]) for i in range(3))
+    return q_rotate(rotation, local)
+
+
+def position_to_center(position, rotation: Quat, dimensions, registration) -> Vec3:
+    off = registration_offset(rotation, dimensions, registration)
+    return (position[0] + off[0], position[1] + off[1], position[2] + off[2])
+
+
+def center_to_position(center, rotation: Quat, dimensions, registration) -> Vec3:
+    off = registration_offset(rotation, dimensions, registration)
+    return (center[0] - off[0], center[1] - off[1], center[2] - off[2])
+
+
 # ------------------------------------------------------------ colours
 def color_to_json(rgb: Iterable[float]) -> dict:
     """Linear 0..1 Blender colour -> Overte 0..255 (sRGB-encoded) colour."""

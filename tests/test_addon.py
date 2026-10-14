@@ -48,3 +48,31 @@ def test_start_stop_and_unlink(addon):
     assert ss.P_TMP not in obj
     bpy.ops.overte.stop()
     assert runtime.session is None
+
+
+def test_glb_export_import_roundtrip(addon):
+    import bmesh
+    from overte_live_link import models
+
+    mesh = bpy.data.meshes.new("Wedge")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    bmesh.ops.scale(bm, vec=(1.0, 2.0, 3.0), verts=bm.verts)        # 1 x 2 x 3
+    bmesh.ops.translate(bm, vec=(0.0, 0.0, 5.0), verts=bm.verts)    # centred 5 up
+    bm.to_mesh(mesh)
+    bm.free()
+    obj = bpy.data.objects.new("Wedge", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    obj.location = (10, 0, 0)  # object transform must not be baked into the model
+    n_objects = len(bpy.data.objects)
+
+    data, size, center = models.export_glb(obj)
+    assert data[:4] == b"glTF"
+    assert size == pytest.approx((1, 2, 3)) and center == pytest.approx((0, 0, 5))
+    assert len(bpy.data.objects) == n_objects  # no temp objects left behind
+
+    back = models.import_model(data, ".glb", "WedgeBack")
+    size2, center2 = models._bbox(back)
+    assert size2 == pytest.approx((1, 2, 3), abs=1e-5)
+    assert center2 == pytest.approx((0, 0, 5), abs=1e-5)
+    assert len(bpy.data.objects) == n_objects and len(bpy.data.scenes) == 1
