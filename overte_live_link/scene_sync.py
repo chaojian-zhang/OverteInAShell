@@ -165,6 +165,14 @@ class SceneSync:
         self.session = None                   # set by LinkSession.attach
         from .models import ModelManager
         self.models = ModelManager(self)
+        # Change tracking. With a depsgraph handler feeding on_depsgraph_update,
+        # only changed objects are diffed each tick, plus a slice of all records
+        # (round robin, a full pass every ~SCAN_TICKS ticks) as a safety net.
+        # Without one (track_dirty False), every record is diffed every tick.
+        self.track_dirty = False
+        self._dirty_names: set[str] = set()
+        self._dirty_data: set = set()
+        self._scan_pos = 0
 
     def attach(self, session) -> None:
         self.session = session
@@ -182,6 +190,15 @@ class SceneSync:
             {"type": "sync"},
         ]
 
+    def on_depsgraph_update(self, depsgraph) -> None:
+        for upd in depsgraph.updates:
+            idb = getattr(upd.id, "original", upd.id)
+            if isinstance(idb, bpy.types.Object):
+                self._dirty_names.add(idb.name)
+            elif isinstance(idb, (bpy.types.Material, bpy.types.Light, bpy.types.Mesh)):
+                self._dirty_data.add(idb)
+        self.models.on_depsgraph_update(depsgraph)
+
     def on_bridge_disconnected(self) -> None:
         self.synced = False
         self.pending_adds.clear()
@@ -191,13 +208,17 @@ class SceneSync:
         return [{"type": "sync"}]
 
     # ------------------------------------------------------------- lookup
-    def _index(self) -> tuple[dict, list]:
-        """id -> object for linked objects; also returns extra objects sharing an id."""
+    def _index(self, new_objects: Optional[list] = None) -> tuple[dict, list]:
+        """id -> object for linked objects; also returns extra objects sharing an id.
+
+        Objects waiting to be created (``overte_tmp``) are appended to ``new_objects``."""
         by_id: dict[str, bpy.types.Object] = {}
         dupes = []
         for obj in self.scene.objects:
             eid = obj.get(P_ID)
             if not eid:
+                if new_objects is not None and obj.get(P_TMP):
+                    new_objects.append(obj)
                 continue
             eid = norm_id(eid)
             prev = by_id.get(eid)
@@ -288,14 +309,9 @@ class SceneSync:
             bpy.context.view_layer.update()
         except Exception:
             pass
-        by_id, dupes = self._index()
+        new_objects: list = []
+        by_id, dupes = self._index(new_objects)
         edits, adds, deletes = [], [], []
-
-        # Rename tracking: the object carrying an id is authoritative.
-        for eid, rec in self.records.items():
-            obj = by_id.get(eid)
-            if obj is not None:
-                rec.obj_name = obj.name
 
         for eid, rec in list(self.records.items()):
             obj = by_id.get(eid)
@@ -305,6 +321,19 @@ class SceneSync:
                     deletes.append(eid)
                     self.remote_ids.discard(eid)
                 continue
+            # Rename tracking: the object carrying an id is authoritative.
+            if rec.obj_name != obj.name:
+                rec.obj_name = obj.name
+                self._dirty_names.add(obj.name)
+
+        # Linked objects whose entity is gone (e.g. brought back by undo) are
+        # reported as missing rather than silently ignored.
+        if self.synced:
+            for eid in by_id:
+                if eid not in self.records and eid not in self.remote_ids:
+                    self.missing_ids.add(eid)
+
+        for eid, rec, obj in self._candidates(by_id):
             cur = self.local_fields(obj, rec.type)
             changed = {k: v for k, v in cur.items() if not field_equal(k, v, rec.local.get(k))}
             if not changed:
@@ -330,9 +359,9 @@ class SceneSync:
             self.pending_adds[tmp] = now
 
         # New objects created with the add-on's operators.
-        for obj in self.scene.objects:
+        for obj in new_objects:
             tmp = obj.get(P_TMP)
-            if not tmp or obj.get(P_ID) or tmp in self.pending_adds:
+            if tmp in self.pending_adds:
                 continue
             etype = obj.get(P_TYPE, "Box")
             props = fields_to_props(self.local_fields(obj, etype))
@@ -355,6 +384,39 @@ class SceneSync:
         if out and self.on_change:
             self.on_change()
         return out
+
+    SCAN_TICKS = 40  # full safety-net pass every 40 ticks (~2 s)
+
+    def _candidates(self, by_id: dict):
+        """(id, record, object) for the records worth diffing this tick."""
+        if not self.track_dirty:
+            for eid, rec in self.records.items():
+                obj = by_id.get(eid)
+                if obj is not None:
+                    yield eid, rec, obj
+            return
+        names, self._dirty_names = self._dirty_names, set()
+        data, self._dirty_data = self._dirty_data, set()
+        ids = list(self.records)
+        chosen: set[str] = set()
+        if ids:
+            step = max(1, -(-len(ids) // self.SCAN_TICKS))
+            start = self._scan_pos % len(ids)
+            chosen.update(ids[start:start + step])
+            self._scan_pos = start + step
+        if names or data:
+            for eid, obj in by_id.items():
+                if eid in chosen or eid not in self.records:
+                    continue
+                if obj.name in names:
+                    chosen.add(eid)
+                elif data and (obj.data in data or any(sl.material in data for sl in obj.material_slots)):
+                    chosen.add(eid)
+        for eid in chosen:
+            rec = self.records.get(eid)
+            obj = by_id.get(eid)
+            if rec is not None and obj is not None:
+                yield eid, rec, obj
 
     # ------------------------------------------------------ incoming
     def handle_message(self, msg: dict) -> list:

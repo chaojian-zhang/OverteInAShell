@@ -51,3 +51,46 @@ jobs:
         with:
           name: overte-logs
           path: .overte-test-logs/
+
+  blender-gui:
+    # The real Blender app under a virtual display: installs the built extension
+    # and runs tests/gui_e2e.py, where Blender's own timers and depsgraph
+    # handlers drive the link (no test harness ticking it).
+    runs-on: ubuntu-24.04
+    env:
+      OVERTE_VERSION: "2026.04.1"
+      OVERTE_DEB: overte-server_2026.04.1-f91d15a-ubuntu-24.04-1_amd64.deb
+      BLENDER: blender-5.2.2-linux-x64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Overte server
+        run: |
+          curl -sSfLO "https://public.overte.org/build/overte/release/$OVERTE_VERSION/$OVERTE_DEB"
+          sudo dpkg-deb -x "$OVERTE_DEB" /
+          sudo ldconfig -n /opt/overte/lib
+          deps=$(dpkg-deb -f "$OVERTE_DEB" Depends | sed 's/([^)]*)//g; s/,/ /g')
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq $deps xvfb x11-apps imagemagick libxi6 libxxf86vm1 libxkbcommon0 libsm6 libgl1-mesa-dri
+      - name: Install Blender
+        run: |
+          curl -sSfL "https://download.blender.org/release/Blender5.2/$BLENDER.tar.xz" | tar xJ
+          echo "BLENDER_BIN=$PWD/$BLENDER/blender" >> "$GITHUB_ENV"
+      - name: Build and install the extension
+        run: |
+          python3 scripts/build_extension.py dist
+          "$BLENDER_BIN" --factory-startup --command extension validate dist/overte_live_link-*.zip
+          "$BLENDER_BIN" --factory-startup --command extension install-file -r user_default -e dist/overte_live_link-*.zip
+          "$BLENDER_BIN" -b --python-expr "import bpy; bpy.context.preferences.view.show_splash=False; bpy.ops.wm.save_userpref()"
+      - name: GUI end-to-end
+        run: |
+          xvfb-run -a -s "-screen 0 1600x1000x24" "$BLENDER_BIN" --python tests/gui_e2e.py -- result.json screenshot.png
+          python3 -c "import json,sys; d=json.load(open('result.json')); print(json.dumps(d, indent=2)); sys.exit(0 if d['ok'] else 1)"
+      - name: Upload screenshot and extension
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: overte-live-link
+          path: |
+            screenshot.png
+            result.json
+            dist/*.zip

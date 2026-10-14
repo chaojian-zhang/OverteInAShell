@@ -2,9 +2,7 @@
 
 import http.server
 import math
-import os
 import threading
-import time
 
 import pytest
 

@@ -349,19 +349,32 @@
     }
 
     // ------------------------------------------------------- connection
+    // Polling reschedules itself: on large domains a poll can take a while, so
+    // the next one waits at least 3x as long as the last took, keeping the
+    // agent responsive (about a quarter of its time at most goes to polling).
+    function schedulePoll(delay) {
+        pollTimer = Script.setTimeout(function () {
+            pollTimer = null;
+            if (!connected) {
+                return;
+            }
+            var t0 = Date.now();
+            try {
+                poll();
+            } catch (e) {
+                log("poll error: " + e);
+            }
+            schedulePoll(Math.max(config.pollMs, 3 * (Date.now() - t0)));
+        }, delay);
+    }
+
     function restartPolling() {
         if (pollTimer) {
-            Script.clearInterval(pollTimer);
+            Script.clearTimeout(pollTimer);
             pollTimer = null;
         }
         if (connected) {
-            pollTimer = Script.setInterval(function () {
-                try {
-                    poll();
-                } catch (e) {
-                    log("poll error: " + e);
-                }
-            }, config.pollMs);
+            schedulePoll(config.pollMs);
         }
     }
 
@@ -415,7 +428,7 @@
 
     Script.scriptEnding.connect(function () {
         if (pollTimer) {
-            Script.clearInterval(pollTimer);
+            Script.clearTimeout(pollTimer);
         }
         if (queryTimer) {
             Script.clearInterval(queryTimer);

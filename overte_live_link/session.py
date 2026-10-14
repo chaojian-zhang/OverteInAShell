@@ -10,9 +10,12 @@ object (``scene_sync.SceneSync`` in Blender, a fake in tests) with methods:
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
+import secrets
 import time
+import urllib.parse
 from typing import Callable, Optional
 
 from .wsserver import LinkServer
@@ -23,16 +26,29 @@ WS_PLACEHOLDER = "__OVERTE_LIVE_LINK_WS_URL__"
 PROTOCOL_VERSION = 1
 
 
+def new_token() -> str:
+    return secrets.token_urlsafe(12)
+
+
+def _query_token(target: str) -> str:
+    query = urllib.parse.urlparse(target).query
+    return urllib.parse.parse_qs(query).get("token", [""])[0]
+
+
 def bridge_script(ws_url: str) -> str:
     with open(BRIDGE_FILE, "r", encoding="utf-8") as f:
         return f.read().replace(WS_PLACEHOLDER, ws_url)
 
 
 class LinkSession:
-    def __init__(self, sync, host: str = "127.0.0.1", port: int = 9420, log: Callable[[str], None] = print):
+    def __init__(self, sync, host: str = "127.0.0.1", port: int = 9420, log: Callable[[str], None] = print,
+                 token: Optional[str] = None):
+        """``token``: shared secret required on the bridge script URL and the
+        WebSocket (``?token=``); ``None`` generates one, ``""`` disables it."""
         self.sync = sync
         self.log = log
-        self.server = LinkServer(host, port, http_handler=self._http)
+        self.token = new_token() if token is None else token
+        self.server = LinkServer(host, port, http_handler=self._http, ws_accept=self._authorized)
         self.active: Optional[int] = None          # cid of the bridge we sync with
         self.bridges: dict[int, dict] = {}         # cid -> hello info (None until hello)
         self.pending: dict[int, Callable] = {}     # req id -> callback(msg, binary)
@@ -72,14 +88,24 @@ class LinkSession:
 
     def bridge_url(self, host: Optional[str] = None) -> str:
         h = host or (self.server.host if self.server.host not in ("0.0.0.0", "") else "127.0.0.1")
-        return f"http://{h}:{self.server.port}{BRIDGE_PATH}"
+        q = f"?token={self.token}" if self.token else ""
+        return f"http://{h}:{self.server.port}{BRIDGE_PATH}{q}"
+
+    def ws_url(self, host_port: str) -> str:
+        q = f"?token={self.token}" if self.token else ""
+        return f"ws://{host_port}/ws{q}"
+
+    def _authorized(self, target: str, headers: dict) -> bool:
+        return not self.token or hmac.compare_digest(_query_token(target), self.token)
 
     # --------------------------------------------------------------- HTTP
     def _http(self, target: str, headers: dict):
         path = target.split("?", 1)[0]
         if path == BRIDGE_PATH:
+            if not self._authorized(target, headers):
+                return 403, "text/plain", b"missing or wrong ?token= (copy the URL from Blender's Overte panel)"
             host = headers.get("host") or f"127.0.0.1:{self.server.port}"
-            return 200, "application/javascript; charset=utf-8", bridge_script(f"ws://{host}/ws").encode("utf-8")
+            return 200, "application/javascript; charset=utf-8", bridge_script(self.ws_url(host)).encode("utf-8")
         if path == "/":
             return 200, "text/plain; charset=utf-8", (
                 "Overte Live Link is running.\n"

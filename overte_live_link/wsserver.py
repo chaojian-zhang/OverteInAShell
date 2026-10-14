@@ -39,7 +39,7 @@ OP_CONT, OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x
 HttpResponse = Optional[Tuple[int, str, bytes]]
 HttpHandler = Callable[[str, dict], HttpResponse]
 
-_REASONS = {200: "OK", 400: "Bad Request", 404: "Not Found", 500: "Internal Server Error"}
+_REASONS = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found", 500: "Internal Server Error"}
 
 
 def encode_frame(opcode: int, payload: bytes, fin: bool = True, mask: Optional[bytes] = None) -> bytes:
@@ -88,10 +88,12 @@ class _Conn:
 
 class LinkServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 9420,
-                 http_handler: Optional[HttpHandler] = None, ws_paths=("/ws", "/")):
+                 http_handler: Optional[HttpHandler] = None, ws_paths=("/ws", "/"),
+                 ws_accept: Optional[Callable[[str, dict], bool]] = None):
         self.host = host
         self.port = port
         self.http_handler = http_handler
+        self.ws_accept = ws_accept  # (target, headers) -> allow the WebSocket upgrade?
         self.ws_paths = tuple(ws_paths)
         self._events: "queue.Queue[tuple]" = queue.Queue()
         self._lock = threading.Lock()
@@ -321,6 +323,9 @@ class LinkServer:
                 headers[k.strip().lower()] = v.strip()
         path = target.split("?", 1)[0]
         if headers.get("upgrade", "").lower() == "websocket" and path in self.ws_paths:
+            if self.ws_accept is not None and not self.ws_accept(target, headers):
+                self._http_reply(c, 403, "text/plain", b"forbidden")
+                return
             key = headers.get("sec-websocket-key", "")
             accept = base64.b64encode(hashlib.sha1(key.encode() + _WS_GUID).digest()).decode()
             resp = ("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"

@@ -37,6 +37,7 @@ import bpy
 from . import scene_sync as ss
 
 P_LOADED = "overte_model_loaded"     # model URL whose geometry the object shows
+P_HASH = "overte_model_hash"         # content hash of the last uploaded version
 ASSET_DIR = "/blender"
 PUBLISHABLE = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
 IMPORTERS = {".glb": "gltf", ".gltf": "gltf", ".fbx": "fbx", ".obj": "obj"}
@@ -196,17 +197,22 @@ class ModelManager:
                     errors.append(f"'{obj.name}' is already a {obj.get(ss.P_TYPE)} entity")
                     continue
                 try:
-                    self._upload(obj)
-                    started += 1
+                    if self._upload(obj):
+                        started += 1
+                    else:
+                        errors.append(f"'{obj.name}' is unchanged since its last upload")
                 except Exception as exc:  # export problems are reported, not fatal
                     errors.append(f"'{obj.name}': {exc}")
             else:
                 errors.append(f"'{obj.name}': {obj.type.lower()} objects can't be published")
         return started, errors
 
-    def _upload(self, obj) -> None:
+    def _upload(self, obj) -> bool:
+        """Export and upload ``obj``; False when the content is unchanged since the last upload."""
         data, size, center = export_glb(obj)
         digest = hashlib.sha256(data).hexdigest()[:12]
+        if obj.get(P_HASH) == digest and obj.get(ss.P_URL) and (obj.get(ss.P_ID) or obj.get(ss.P_TMP)):
+            return False
         path = f"{ASSET_DIR}/{_safe_name(obj.name)}-{digest}.glb"
         name = obj.name
         self.in_flight += 1
@@ -216,11 +222,12 @@ class ModelManager:
         def done(reply, _binary):
             self.in_flight -= 1
             self._publishing.discard(name)
-            self._results.put(("uploaded", name, reply, size, center))
+            self._results.put(("uploaded", name, reply, size, center, digest))
 
         self.session.request({"type": "upload", "path": path, "size": len(data)}, done, binary=data)
+        return True
 
-    def _finish_upload(self, name, reply, size, center) -> None:
+    def _finish_upload(self, name, reply, size, center, digest) -> None:
         obj = self.sync.scene.objects.get(name)
         if obj is None:
             return
@@ -232,6 +239,7 @@ class ModelManager:
         obj[ss.P_CENTER] = center
         obj[ss.P_URL] = url
         obj[P_LOADED] = url
+        obj[P_HASH] = digest
         obj[ss.P_TYPE] = "Model"
         if not obj.get(ss.P_ID) and not obj.get(ss.P_TMP):
             obj[ss.P_TMP] = ss.new_tmp_id()  # create the entity on the next sync tick

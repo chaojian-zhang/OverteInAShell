@@ -13,5 +13,5 @@ blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
-network = "Runs a local WebSocket/HTTP server the Overte bridge script connects to"
-files = "Exports meshes to temporary glTF files for upload to the Overte asset server"
+network = "Runs a local server the Overte bridge script connects to"
+files = "Writes temporary glTF files to upload or import models"

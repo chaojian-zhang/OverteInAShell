@@ -33,14 +33,16 @@ def _redraw() -> None:
 
 
 def start(scene, host: str, port: int, sync_deletes: bool = True,
-          auto_load_models: bool = True, auto_update_models: bool = True) -> LinkSession:
+          auto_load_models: bool = True, auto_update_models: bool = True,
+          token: Optional[str] = None) -> LinkSession:
     global session
     stop()
     sync = SceneSync(scene, sync_deletes=sync_deletes, log=log)
     sync.models.auto_load = auto_load_models
     sync.models.auto_update = auto_update_models
     sync.on_change = _redraw
-    s = LinkSession(sync, host, port, log=log)
+    sync.track_dirty = True  # fed by _on_depsgraph_update
+    s = LinkSession(sync, host, port, log=log, token=token)
     s.start()
     session = s
     if not bpy.app.timers.is_registered(_tick):
@@ -73,7 +75,7 @@ def _tick():
 def _on_depsgraph_update(scene, depsgraph):
     if session is not None:
         try:
-            session.sync.models.on_depsgraph_update(depsgraph)
+            session.sync.on_depsgraph_update(depsgraph)
         except Exception:
             traceback.print_exc()
 
