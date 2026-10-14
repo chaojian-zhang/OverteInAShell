@@ -1,0 +1,365 @@
+"""Model entities: publish Blender meshes to Overte and load model geometry back.
+
+Publishing
+    The evaluated mesh (modifiers applied) is exported as GLB in the object's
+    own space, uploaded through the bridge to the domain's asset server
+    (``atp:/blender/<name>-<hash>.glb``) and becomes a Model entity. The object
+    keeps its mesh, and its local bounding box becomes the entity's natural
+    size (``overte_base``/``overte_center``), so moving or scaling it in either
+    program keeps the two in step. Editing the mesh re-uploads it (content
+    hashed, so every version gets its own URL and caches never serve stale
+    geometry).
+
+Loading
+    Model entities arriving from Overte start as cube empties. Their model
+    (``atp:`` through the bridge, ``http(s):`` downloaded directly) is
+    imported and swapped in as a mesh object, keeping the link.
+
+All Blender data work happens on the main thread, inside temporary scenes so
+the user's scene and selection are never touched.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import queue
+import re
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from typing import Optional
+
+import bpy
+
+from . import scene_sync as ss
+
+P_LOADED = "overte_model_loaded"     # model URL whose geometry the object shows
+ASSET_DIR = "/blender"
+PUBLISHABLE = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
+IMPORTERS = {".glb": "gltf", ".gltf": "gltf", ".fbx": "fbx", ".obj": "obj"}
+MAX_DOWNLOAD = 256 * 1024 * 1024
+REPUBLISH_DELAY = 1.0  # seconds after the last edit before re-uploading
+
+
+def _safe_name(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
+    return s[:48] or "model"
+
+
+def _bbox(mesh) -> tuple[tuple, tuple]:
+    xs = [v.co.x for v in mesh.vertices]
+    ys = [v.co.y for v in mesh.vertices]
+    zs = [v.co.z for v in mesh.vertices]
+    lo = (min(xs), min(ys), min(zs))
+    hi = (max(xs), max(ys), max(zs))
+    size = tuple(max(hi[i] - lo[i], 1e-4) for i in range(3))
+    center = tuple((hi[i] + lo[i]) / 2 for i in range(3))
+    return size, center
+
+
+class _TempScene:
+    """A throwaway scene to run import/export operators in."""
+
+    def __enter__(self):
+        self.scene = bpy.data.scenes.new("__overte_tmp__")
+        return self.scene
+
+    def __exit__(self, *exc):
+        sc = self.scene
+        for obj in list(sc.objects):
+            data = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if isinstance(data, bpy.types.Mesh) and data.users == 0:
+                bpy.data.meshes.remove(data)
+        bpy.data.scenes.remove(sc)
+        return False
+
+
+def export_glb(obj) -> tuple[bytes, tuple, tuple]:
+    """GLB bytes of ``obj``'s evaluated geometry in its local space, plus bbox size/centre."""
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    mesh = bpy.data.meshes.new_from_object(obj.evaluated_get(depsgraph),
+                                           preserve_all_data_layers=True, depsgraph=depsgraph)
+    try:
+        if not mesh.vertices:
+            raise ValueError(f"'{obj.name}' has no geometry to publish")
+        size, center = _bbox(mesh)
+        fd, path = tempfile.mkstemp(suffix=".glb", prefix="overte_")
+        os.close(fd)
+        try:
+            with _TempScene() as sc:
+                tmp = bpy.data.objects.new(obj.name, mesh)
+                sc.collection.objects.link(tmp)
+                with bpy.context.temp_override(scene=sc, view_layer=sc.view_layers[0]):
+                    bpy.ops.export_scene.gltf(
+                        filepath=path, export_format="GLB", use_active_scene=True, export_yup=True,
+                        export_cameras=False, export_lights=False, export_animations=False,
+                        export_extras=False)
+                bpy.data.objects.remove(tmp, do_unlink=True)
+            with open(path, "rb") as f:
+                return f.read(), size, center
+        finally:
+            os.unlink(path)
+    finally:
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+
+
+def import_model(data: bytes, ext: str, name: str) -> Optional[bpy.types.Mesh]:
+    """Import model bytes into a single mesh (Blender Z-up, model-local space)."""
+    kind = IMPORTERS.get(ext.lower())
+    if kind is None:
+        raise ValueError(f"unsupported model format '{ext}'")
+    fd, path = tempfile.mkstemp(suffix=ext, prefix="overte_")
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    meshes_before = set(bpy.data.meshes)
+    result = None
+    try:
+        with _TempScene() as sc:
+            with bpy.context.temp_override(scene=sc, view_layer=sc.view_layers[0], collection=sc.collection):
+                if kind == "gltf":
+                    bpy.ops.import_scene.gltf(filepath=path)
+                elif kind == "fbx":
+                    bpy.ops.import_scene.fbx(filepath=path)
+                else:
+                    bpy.ops.wm.obj_import(filepath=path)
+            sc.view_layers[0].update()
+            meshes = [o for o in sc.objects if o.type == "MESH"]
+            if not meshes:
+                return None
+            for o in meshes:  # make sure each mesh is single-user before joining
+                if o.data.users > 1:
+                    o.data = o.data.copy()
+            if len(meshes) > 1:
+                with bpy.context.temp_override(scene=sc, view_layer=sc.view_layers[0], active_object=meshes[0],
+                                               object=meshes[0], selected_objects=meshes,
+                                               selected_editable_objects=meshes):
+                    bpy.ops.object.join()
+            sc.view_layers[0].update()
+            joined = meshes[0]
+            mesh = joined.data
+            mesh.transform(joined.matrix_world)  # bake the importer's transforms
+            mesh.name = name
+            joined.data = bpy.data.meshes.new("__overte_placeholder__")  # detach so cleanup keeps ours
+            result = mesh
+            return mesh
+    finally:
+        os.unlink(path)
+        for m in set(bpy.data.meshes) - meshes_before:  # importer/join leftovers
+            if m != result and m.users == 0:
+                bpy.data.meshes.remove(m)
+
+
+def _url_ext(url: str) -> str:
+    path = urllib.parse.urlparse(url).path
+    return os.path.splitext(path)[1].lower()
+
+
+class ModelManager:
+    def __init__(self, sync, auto_load: bool = True, auto_update: bool = True):
+        self.sync = sync
+        self.auto_load = auto_load
+        self.auto_update = auto_update
+        self.in_flight = 0
+        self._results: "queue.Queue[tuple]" = queue.Queue()
+        self._dirty: dict[str, float] = {}       # object name -> last geometry change
+        self._loading: set[str] = set()          # entity ids with a load in progress
+        self._publishing: set[str] = set()       # object names being uploaded
+
+    @property
+    def session(self):
+        return getattr(self.sync, "session", None)
+
+    @property
+    def connected(self) -> bool:
+        s = self.session
+        return s is not None and s.bridge_info is not None
+
+    # ---------------------------------------------------------- publish
+    def publish(self, objects) -> tuple[int, list[str]]:
+        """Publish objects as Model (meshes) or Light entities. Returns (started, errors)."""
+        started, errors = 0, []
+        if not self.connected:
+            return 0, ["no Overte bridge connected"]
+        for obj in objects:
+            linked = obj.get(ss.P_ID) or obj.get(ss.P_TMP)
+            if obj.type == "LIGHT" and not linked:
+                obj[ss.P_TYPE] = "Light"
+                obj[ss.P_TMP] = ss.new_tmp_id()
+                started += 1
+            elif obj.type in PUBLISHABLE:
+                if linked and obj.get(ss.P_TYPE) != "Model":
+                    errors.append(f"'{obj.name}' is already a {obj.get(ss.P_TYPE)} entity")
+                    continue
+                try:
+                    self._upload(obj)
+                    started += 1
+                except Exception as exc:  # export problems are reported, not fatal
+                    errors.append(f"'{obj.name}': {exc}")
+            else:
+                errors.append(f"'{obj.name}': {obj.type.lower()} objects can't be published")
+        return started, errors
+
+    def _upload(self, obj) -> None:
+        data, size, center = export_glb(obj)
+        digest = hashlib.sha256(data).hexdigest()[:12]
+        path = f"{ASSET_DIR}/{_safe_name(obj.name)}-{digest}.glb"
+        name = obj.name
+        self.in_flight += 1
+        self._publishing.add(name)
+        self._dirty.pop(name, None)
+
+        def done(reply, _binary):
+            self.in_flight -= 1
+            self._publishing.discard(name)
+            self._results.put(("uploaded", name, reply, size, center))
+
+        self.session.request({"type": "upload", "path": path, "size": len(data)}, done, binary=data)
+
+    def _finish_upload(self, name, reply, size, center) -> None:
+        obj = self.sync.scene.objects.get(name)
+        if obj is None:
+            return
+        if reply.get("error") or not reply.get("url"):
+            self.sync.log(f"Upload of '{name}' failed: {reply.get('error') or reply.get('message')}")
+            return
+        url = reply["url"]
+        obj[ss.P_BASE] = size
+        obj[ss.P_CENTER] = center
+        obj[ss.P_URL] = url
+        obj[P_LOADED] = url
+        obj[ss.P_TYPE] = "Model"
+        if not obj.get(ss.P_ID) and not obj.get(ss.P_TMP):
+            obj[ss.P_TMP] = ss.new_tmp_id()  # create the entity on the next sync tick
+        # A linked object: modelURL and dimensions change, and the regular
+        # sync sends them as an edit.
+        self.sync.log(f"Published '{name}' as {url}")
+
+    # ------------------------------------------------------- auto update
+    def on_depsgraph_update(self, depsgraph) -> None:
+        if not self.auto_update:
+            return
+        now = time.time()
+        meshes = set()
+        for upd in depsgraph.updates:
+            if not (upd.is_updated_geometry or upd.is_updated_shading):
+                continue
+            idb = upd.id.original if hasattr(upd.id, "original") else upd.id
+            if isinstance(idb, bpy.types.Object):
+                if self._is_published(idb):
+                    self._dirty[idb.name] = now
+            elif isinstance(idb, (bpy.types.Mesh, bpy.types.Material)):
+                meshes.add(idb)
+        if meshes:
+            for obj in self.sync.scene.objects:
+                if self._is_published(obj) and (obj.data in meshes or
+                                                any(s.material in meshes for s in obj.material_slots)):
+                    self._dirty[obj.name] = now
+
+    def _is_published(self, obj) -> bool:
+        return (obj.get(ss.P_TYPE) == "Model" and obj.type in PUBLISHABLE and bool(obj.get(ss.P_ID))
+                and str(obj.get(P_LOADED, "")).startswith(f"atp:{ASSET_DIR}/"))
+
+    # --------------------------------------------------------- loading
+    def maybe_load(self, obj, url: str) -> None:
+        """Called for Model entities whose modelURL is new or changed."""
+        if not self.auto_load or not url or obj.get(P_LOADED) == url:
+            return
+        self.load(obj, url)
+
+    def load(self, obj, url: str) -> None:
+        eid = ss.norm_id(obj.get(ss.P_ID))
+        if eid in self._loading:
+            return
+        ext = _url_ext(url)
+        if ext not in IMPORTERS:
+            self.sync.log(f"Model '{obj.name}': can't load '{ext or url}' files")
+            obj[P_LOADED] = url  # don't retry
+            return
+        self._loading.add(eid)
+        self.in_flight += 1
+        if url.startswith("atp:"):
+            def done(reply, data):
+                self.in_flight -= 1
+                self._results.put(("loaded", eid, url, ext, data, reply.get("error")))
+            if not self.connected:
+                done({"error": "no bridge"}, None)
+            else:
+                self.session.request({"type": "fetch", "url": url}, done)
+        elif url.startswith(("http://", "https://")):
+            threading.Thread(target=self._download, args=(eid, url, ext), daemon=True).start()
+        else:
+            self.in_flight -= 1
+            self._loading.discard(eid)
+            obj[P_LOADED] = url
+
+    def _download(self, eid, url, ext) -> None:
+        data, err = None, None
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r:
+                data = r.read(MAX_DOWNLOAD + 1)
+            if len(data) > MAX_DOWNLOAD:
+                data, err = None, "model file too large"
+        except Exception as exc:
+            err = str(exc)
+        self.in_flight -= 1
+        self._results.put(("loaded", eid, url, ext, data, err))
+
+    def _finish_load(self, eid, url, ext, data, err) -> None:
+        self._loading.discard(eid)
+        proxy = self.sync.object_for(eid)
+        if proxy is None:
+            return
+        if err or not data:
+            self.sync.log(f"Could not load model for '{proxy.name}': {err}")
+            proxy[P_LOADED] = url
+            return
+        try:
+            mesh = import_model(data, ext, f"Overte {proxy.name}")
+        except Exception as exc:
+            self.sync.log(f"Could not import model for '{proxy.name}': {exc}")
+            proxy[P_LOADED] = url
+            return
+        if mesh is None or not mesh.vertices:
+            proxy[P_LOADED] = url
+            return
+        size, center = _bbox(mesh)
+        self.sync.replace_object_data(proxy, mesh, size, center)
+        obj = self.sync.object_for(eid)
+        if obj is not None:
+            obj[P_LOADED] = url
+
+    # ------------------------------------------------------------ tick
+    def tick(self) -> None:
+        while True:
+            try:
+                item = self._results.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if item[0] == "uploaded":
+                    self._finish_upload(*item[1:])
+                else:
+                    self._finish_load(*item[1:])
+            except Exception as exc:
+                self.sync.log(f"model update failed: {exc}")
+        if self._dirty and self.connected:
+            now = time.time()
+            for name, t in list(self._dirty.items()):
+                if now - t < REPUBLISH_DELAY or name in self._publishing:
+                    continue
+                obj = self.sync.scene.objects.get(name)
+                if obj is None or not self._is_published(obj):
+                    self._dirty.pop(name, None)
+                    continue
+                if obj.mode == "EDIT":
+                    continue  # wait until the user leaves edit mode
+                self._dirty.pop(name, None)
+                try:
+                    self._upload(obj)
+                except Exception as exc:
+                    self.sync.log(f"Could not update model '{name}': {exc}")

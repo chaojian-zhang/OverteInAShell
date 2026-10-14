@@ -38,8 +38,10 @@ P_BASE = "overte_base"
 P_CENTER = "overte_center"
 P_URL = "overte_model_url"
 P_TEXT = "overte_text"
+P_REG = "overte_registration"   # entity registrationPoint, when not the centre
 
 NULL_ID = "{00000000-0000-0000-0000-000000000000}"
+DEFAULT_REG = (0.5, 0.5, 0.5)
 COLLECTION = "Overte"
 MESH_PREFIX = "OverteUnit_"
 
@@ -84,11 +86,11 @@ def remote_fields(props: dict) -> dict:
     """Overte entity properties -> comparable field values."""
     f = {}
     if "position" in props or "rotation" in props or "dimensions" in props:
-        f["transform"] = (
-            _vec(props.get("position")),
-            cv.q_canonical(cv.json_quat(props.get("rotation"))),
-            _vec(props.get("dimensions"), (1.0, 1.0, 1.0)),
-        )
+        rot = cv.q_canonical(cv.json_quat(props.get("rotation")))
+        dims = _vec(props.get("dimensions"), (1.0, 1.0, 1.0))
+        reg = _vec(props.get("registrationPoint"), DEFAULT_REG)
+        # Transforms are compared and stored as box centres.
+        f["transform"] = (cv.position_to_center(_vec(props.get("position")), rot, dims, reg), rot, dims)
     if "name" in props:
         f["name"] = props.get("name") or ""
     if "parentID" in props:
@@ -114,13 +116,16 @@ def remote_fields(props: dict) -> dict:
     return f
 
 
-def fields_to_props(fields: dict) -> dict:
-    """Comparable field values -> Overte properties (for edit/add)."""
+def fields_to_props(fields: dict, registration=None) -> dict:
+    """Comparable field values -> Overte properties (for edit/add).
+
+    ``registration`` is the entity's registrationPoint (default centre)."""
     p = {}
+    reg = tuple(registration) if registration is not None else DEFAULT_REG
     for k, v in fields.items():
         if k == "transform":
-            pos, rot, dims = v
-            p["position"] = cv.vec_json(pos)
+            center, rot, dims = v
+            p["position"] = cv.vec_json(cv.center_to_position(center, rot, dims, reg))
             p["rotation"] = cv.quat_json(rot)
             p["dimensions"] = cv.vec_json(dims)
         elif k == "color":
@@ -157,6 +162,12 @@ class SceneSync:
         self.synced = False                   # first full snapshot received
         self.stats = {"sent": 0, "received": 0}
         self.on_change = None                 # optional UI refresh callback
+        self.session = None                   # set by LinkSession.attach
+        from .models import ModelManager
+        self.models = ModelManager(self)
+
+    def attach(self, session) -> None:
+        self.session = session
 
     @property
     def scene(self) -> bpy.types.Scene:
@@ -267,6 +278,7 @@ class SceneSync:
 
     # ------------------------------------------------------ outgoing
     def collect_outgoing(self) -> list:
+        self.models.tick()
         if not self.synced:
             return []
         now = time.time()
@@ -301,9 +313,11 @@ class SceneSync:
                 changed["transform"] = cur["transform"]  # world transform must accompany reparenting
             if "transform" in changed:
                 rec.sent_at = now
+            if "modelURL" in changed:
+                self.models.maybe_load(obj, changed["modelURL"])
             rec.local.update(changed)
             rec.remote.update(changed)
-            edits.append({"id": eid, "props": fields_to_props(changed)})
+            edits.append({"id": eid, "props": fields_to_props(changed, obj.get(P_REG))})
 
         # Objects duplicated in Blender become clones of the original entity.
         for src_id, obj in dupes:
@@ -311,7 +325,8 @@ class SceneSync:
             del obj[P_ID]
             obj[P_TMP] = tmp
             etype = obj.get(P_TYPE, "Box")
-            adds.append({"tmp": tmp, "cloneOf": src_id, "props": fields_to_props(self.local_fields(obj, etype))})
+            adds.append({"tmp": tmp, "cloneOf": src_id,
+                         "props": fields_to_props(self.local_fields(obj, etype), obj.get(P_REG))})
             self.pending_adds[tmp] = now
 
         # New objects created with the add-on's operators.
@@ -322,6 +337,8 @@ class SceneSync:
             etype = obj.get(P_TYPE, "Box")
             props = fields_to_props(self.local_fields(obj, etype))
             props["type"] = etype
+            if P_REG in obj:
+                del obj[P_REG]  # new entities use the default (centre)
             if obj.get(P_SHAPE):
                 props["shape"] = obj[P_SHAPE]
             adds.append({"tmp": tmp, "props": props})
@@ -387,6 +404,7 @@ class SceneSync:
             if obj is None:
                 obj = self._create_object(props)
                 rec = None
+            _store_registration(obj, props)
             if rec is None:
                 rec = Record(eid, props.get("type", "Box"), obj.name)
                 self.records[eid] = rec
@@ -409,6 +427,9 @@ class SceneSync:
         for rec, obj, changed in touched:
             self._apply_fields(obj, rec.type, {k: v for k, v in changed.items() if k != "parentID"})
         bpy.context.view_layer.update()
+        for rec, obj, changed in touched:
+            if rec.type == "Model" and changed.get("modelURL"):
+                self.models.maybe_load(obj, changed["modelURL"])
         # Read back what Blender now has, including children that moved with a parent.
         refresh = {rec.id for rec, _, _ in touched}
         for rec, obj, _ in touched:
@@ -438,6 +459,7 @@ class SceneSync:
             props = item.get("props") or {}
             del obj[P_TMP]
             obj[P_ID] = eid
+            _store_registration(obj, props)
             etype = props.get("type") or obj.get(P_TYPE, "Box")
             obj[P_TYPE] = etype
             rec = Record(eid, etype, obj.name)
@@ -459,6 +481,7 @@ class SceneSync:
                 continue
             self.log(f"Overte rejected an edit to '{obj.name}' (locked or no permission); reverting")
             fields = remote_fields(r["props"])
+            _store_registration(obj, r["props"])
             rec.remote.update(fields)
             if "parentID" in fields:
                 self._apply_parent(obj, fields["parentID"])
@@ -543,6 +566,50 @@ class SceneSync:
         if "text" in fields:
             obj[P_TEXT] = fields["text"]
 
+    def replace_object_data(self, old, data, base, center) -> bpy.types.Object:
+        """Swap a linked object for a new object with ``data`` (e.g. a loaded model
+        mesh replacing a cube empty), keeping the link, hierarchy and placement."""
+        eid = norm_id(old.get(P_ID))
+        rec = self.records.get(eid)
+        name = old.name
+        new = bpy.data.objects.new(name + ".overte_new", data)
+        for k, v in old.items():
+            new[k] = v
+        new[P_BASE] = tuple(base)
+        new[P_CENTER] = tuple(center)
+        for col in old.users_collection:
+            col.objects.link(new)
+        new.hide_render = old.hide_render
+        new.lock_location, new.lock_rotation, new.lock_scale = old.lock_location, old.lock_rotation, old.lock_scale
+        children = [(c, c.matrix_world.copy()) for c in old.children]
+        new.parent = old.parent
+        new.matrix_parent_inverse = Matrix.Identity(4)
+        etype = rec.type if rec else old.get(P_TYPE, "Model")
+        transform = rec.remote.get("transform") if rec else None
+        if transform is None:
+            transform = self.local_fields(old, etype)["transform"]
+        was_active = bpy.context.view_layer.objects.active == old
+        was_selected = old.select_get()
+        bpy.data.objects.remove(old, do_unlink=True)
+        new.name = name
+        self._apply_fields(new, etype, {"transform": transform})
+        bpy.context.view_layer.update()
+        for child, mw in children:
+            child.parent = new
+            child.matrix_parent_inverse = Matrix.Identity(4)
+            child.matrix_world = mw
+        bpy.context.view_layer.update()
+        try:
+            new.select_set(was_selected)
+            if was_active:
+                bpy.context.view_layer.objects.active = new
+        except RuntimeError:
+            pass  # not in the active view layer
+        if rec:
+            rec.obj_name = new.name
+            rec.local = self.local_fields(new, etype)
+        return new
+
     # --------------------------------------------------- user actions
     def unlink(self, obj) -> None:
         eid = obj.get(P_ID)
@@ -569,6 +636,21 @@ class SceneSync:
 
 
 # ------------------------------------------------------------- helpers
+def new_tmp_id() -> str:
+    return str(uuid.uuid4())
+
+
+def _store_registration(obj, props: dict) -> None:
+    if "registrationPoint" not in props:
+        return
+    reg = _vec(props.get("registrationPoint"), DEFAULT_REG)
+    if cv.close(reg, DEFAULT_REG, 1e-6):
+        if P_REG in obj:
+            del obj[P_REG]
+    else:
+        obj[P_REG] = reg
+
+
 def overte_collection(scene) -> bpy.types.Collection:
     """The "Overte" collection entities from the domain are placed in."""
     col = bpy.data.collections.get(COLLECTION)

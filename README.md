@@ -49,10 +49,27 @@ other users all behave as they would in-world.
 | locked | location/rotation/scale locks | both |
 | create / delete | add (Add → Overte Entity or sidebar menu) / delete | both |
 | Shift+D duplicate | clones the entity with all its properties | Blender → Overte |
+| Model entity | mesh (geometry downloaded from `atp:` / `http(s):`) | both |
 
-Box, Sphere and Shape entities appear as unit meshes; lights as lights; other
-types (Zone, Model, Text, …) as cube empties sized to their dimensions.
-Properties the add-on doesn't map are left untouched in Overte.
+Box, Sphere and Shape entities appear as unit meshes, lights as lights, and
+Model entities as their actual geometry (`.glb`, `.gltf`, `.fbx`, `.obj`).
+Other types (Zone, Text, Image, …) appear as cube empties sized to their
+dimensions. Properties the add-on doesn't map are left untouched in Overte.
+Entities with a non-centre `registrationPoint` are handled.
+
+### Publishing your own meshes
+
+Select any mesh (curves and text work too) and choose **Object → Publish to
+Overte** or the sidebar's **Publish** button. The add-on exports the evaluated
+mesh (modifiers applied, materials and textures embedded) as GLB, uploads it
+to the domain's asset server as `atp:/blender/<name>-<hash>.glb` and creates a
+Model entity in the object's place. The object's origin can be anywhere: the
+entity is fitted to the mesh's bounding box.
+
+Edit the mesh afterwards and, once you leave Edit Mode, the new version is
+uploaded and the entity switches to it (turn off *Re-upload edited models* to
+do this by hand with **Re-upload**). Uploading needs asset-server write
+permission, which a domain Persistent Script always has.
 
 ## Layout
 
