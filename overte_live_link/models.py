@@ -13,7 +13,13 @@ Publishing
 Loading
     Model entities arriving from Overte start as cube empties. Their model
     (``atp:`` through the bridge, ``http(s):`` downloaded directly) is
-    imported and swapped in as a mesh object, keeping the link.
+    imported and swapped in as a mesh object, keeping the link. Each model URL
+    is fetched and imported once; every entity using it shares that mesh.
+
+Converting
+    Box, Sphere and Shape entities are drawn by Overte, so their Blender mesh
+    can't be edited. Converting one publishes its mesh as a Model entity in
+    its place and deletes the original.
 
 All Blender data work happens on the main thread, inside temporary scenes so
 the user's scene and selection are never touched.
@@ -25,6 +31,7 @@ import hashlib
 import os
 import queue
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -38,6 +45,7 @@ from . import scene_sync as ss
 
 P_LOADED = "overte_model_loaded"     # model URL whose geometry the object shows
 P_HASH = "overte_model_hash"         # content hash of the last uploaded version
+P_SOURCE = "overte_model_source"     # on imported meshes: the model URL they came from
 ASSET_DIR = "/blender"
 PUBLISHABLE = {"MESH", "CURVE", "SURFACE", "META", "FONT"}
 IMPORTERS = {".glb": "gltf", ".gltf": "gltf", ".fbx": "fbx", ".obj": "obj"}
@@ -87,6 +95,13 @@ def export_glb(obj) -> tuple[bytes, tuple, tuple]:
     try:
         if not mesh.vertices:
             raise ValueError(f"'{obj.name}' has no geometry to publish")
+        # Materials linked to the object rather than its mesh (as on primitives)
+        # don't come with the mesh; put them on the exported copy.
+        for i, slot in enumerate(obj.material_slots):
+            if slot.link == "OBJECT" and slot.material is not None:
+                while len(mesh.materials) <= i:
+                    mesh.materials.append(None)
+                mesh.materials[i] = slot.material
         size, center = _bbox(mesh)
         fd, path = tempfile.mkstemp(suffix=".glb", prefix="overte_")
         os.close(fd)
@@ -114,8 +129,11 @@ def import_model(data: bytes, ext: str, name: str) -> Optional[bpy.types.Mesh]:
     kind = IMPORTERS.get(ext.lower())
     if kind is None:
         raise ValueError(f"unsupported model format '{ext}'")
-    fd, path = tempfile.mkstemp(suffix=ext, prefix="overte_")
-    with os.fdopen(fd, "wb") as f:
+    # A folder of its own: importers look for textures next to the file (the
+    # FBX one recursively), which in the shared temp folder can take minutes.
+    tmpdir = tempfile.mkdtemp(prefix="overte_")
+    path = os.path.join(tmpdir, "model" + ext.lower())
+    with open(path, "wb") as f:
         f.write(data)
     meshes_before = set(bpy.data.meshes)
     result = None
@@ -124,6 +142,11 @@ def import_model(data: bytes, ext: str, name: str) -> Optional[bpy.types.Mesh]:
             with bpy.context.temp_override(scene=sc, view_layer=sc.view_layers[0], collection=sc.collection):
                 if kind == "gltf":
                     bpy.ops.import_scene.gltf(filepath=path)
+                elif kind == "fbx" and "fbx_import" in dir(bpy.ops.wm):
+                    # Blender 4.5+'s native importer. The Python one switches the
+                    # *window's* active object into Edit Mode to build armatures,
+                    # so rigged models fail inside a temporary scene.
+                    bpy.ops.wm.fbx_import(filepath=path)
                 elif kind == "fbx":
                     bpy.ops.import_scene.fbx(filepath=path)
                 else:
@@ -149,7 +172,7 @@ def import_model(data: bytes, ext: str, name: str) -> Optional[bpy.types.Mesh]:
             result = mesh
             return mesh
     finally:
-        os.unlink(path)
+        shutil.rmtree(tmpdir, ignore_errors=True)
         for m in set(bpy.data.meshes) - meshes_before:  # importer/join leftovers
             if m != result and m.users == 0:
                 bpy.data.meshes.remove(m)
@@ -158,6 +181,23 @@ def import_model(data: bytes, ext: str, name: str) -> Optional[bpy.types.Mesh]:
 def _url_ext(url: str) -> str:
     path = urllib.parse.urlparse(url).path
     return os.path.splitext(path)[1].lower()
+
+
+def _url_name(url: str) -> str:
+    return os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(url).path)) or "model"
+
+
+def _imported_mesh(url: str) -> Optional[bpy.types.Mesh]:
+    """The mesh already imported from ``url``, which every entity using it shares."""
+    for mesh in bpy.data.meshes:
+        if mesh.get(P_SOURCE) == url and len(mesh.vertices):
+            return mesh
+    return None
+
+
+def convertible(obj) -> bool:
+    """A linked Box, Sphere or Shape entity that can become a Model of its mesh."""
+    return obj.type == "MESH" and bool(obj.get(ss.P_ID)) and obj.get(ss.P_TYPE) in ss.PRIMITIVE_TYPES
 
 
 class ModelManager:
@@ -169,6 +209,7 @@ class ModelManager:
         self._results: "queue.Queue[tuple]" = queue.Queue()
         self._dirty: dict[str, float] = {}       # object name -> last geometry change
         self._loading: set[str] = set()          # entity ids with a load in progress
+        self._waiting: dict[str, set[str]] = {}  # model URL in flight -> entity ids that want it
         self._publishing: set[str] = set()       # object names being uploaded
 
     @property
@@ -193,8 +234,13 @@ class ModelManager:
                 obj[ss.P_TMP] = ss.new_tmp_id()
                 started += 1
             elif obj.type in PUBLISHABLE:
-                if linked and obj.get(ss.P_TYPE) != "Model":
-                    errors.append(f"'{obj.name}' is already a {obj.get(ss.P_TYPE)} entity")
+                etype = obj.get(ss.P_TYPE)
+                if linked and etype in ss.PRIMITIVE_TYPES:
+                    errors.append(f"'{obj.name}' is a {etype} entity, whose shape Overte draws itself; "
+                                  "use Convert to Model to replace it with this mesh")
+                    continue
+                if linked and etype != "Model":
+                    errors.append(f"'{obj.name}' is already a {etype} entity")
                     continue
                 try:
                     if self._upload(obj):
@@ -207,11 +253,36 @@ class ModelManager:
                 errors.append(f"'{obj.name}': {obj.type.lower()} objects can't be published")
         return started, errors
 
-    def _upload(self, obj) -> bool:
-        """Export and upload ``obj``; False when the content is unchanged since the last upload."""
+    def convert(self, objects) -> tuple[int, list[str]]:
+        """Replace Box, Sphere and Shape entities with Model entities of their meshes,
+        in place. Each original entity is deleted once its replacement exists."""
+        started, errors = 0, []
+        if not self.connected:
+            return 0, ["no Overte bridge connected"]
+        for obj in objects:
+            if not convertible(obj):
+                errors.append(f"'{obj.name}' is not a Box, Sphere or Shape entity")
+                continue
+            if obj.data.users > 1:
+                # Primitives share one unit mesh; give this one its own to edit.
+                obj.data = obj.data.copy()
+                obj.data.use_fake_user = False
+                obj.data.name = obj.name
+            try:
+                self._upload(obj, replace=True)
+                started += 1
+            except Exception as exc:
+                errors.append(f"'{obj.name}': {exc}")
+        return started, errors
+
+    def _upload(self, obj, replace: bool = False) -> bool:
+        """Export and upload ``obj``; False when the content is unchanged since the last upload.
+
+        ``replace``: the object's primitive entity is replaced by the new Model."""
         data, size, center = export_glb(obj)
         digest = hashlib.sha256(data).hexdigest()[:12]
-        if obj.get(P_HASH) == digest and obj.get(ss.P_URL) and (obj.get(ss.P_ID) or obj.get(ss.P_TMP)):
+        if (not replace and obj.get(P_HASH) == digest and obj.get(ss.P_URL)
+                and (obj.get(ss.P_ID) or obj.get(ss.P_TMP))):
             return False
         path = f"{ASSET_DIR}/{_safe_name(obj.name)}-{digest}.glb"
         name = obj.name
@@ -222,12 +293,12 @@ class ModelManager:
         def done(reply, _binary):
             self.in_flight -= 1
             self._publishing.discard(name)
-            self._results.put(("uploaded", name, reply, size, center, digest))
+            self._results.put(("uploaded", name, reply, size, center, digest, replace))
 
         self.session.request({"type": "upload", "path": path, "size": len(data)}, done, binary=data)
         return True
 
-    def _finish_upload(self, name, reply, size, center, digest) -> None:
+    def _finish_upload(self, name, reply, size, center, digest, replace=False) -> None:
         obj = self.sync.scene.objects.get(name)
         if obj is None:
             return
@@ -235,6 +306,8 @@ class ModelManager:
             self.sync.log(f"Upload of '{name}' failed: {reply.get('error') or reply.get('message')}")
             return
         url = reply["url"]
+        if replace and convertible(obj):
+            self.sync.begin_replace(obj)  # the object becomes a new (Model) entity
         obj[ss.P_BASE] = size
         obj[ss.P_CENTER] = center
         obj[ss.P_URL] = url
@@ -254,14 +327,16 @@ class ModelManager:
         now = time.time()
         meshes = set()
         for upd in depsgraph.updates:
-            if not (upd.is_updated_geometry or upd.is_updated_shading):
-                continue
             idb = upd.id.original if hasattr(upd.id, "original") else upd.id
             if isinstance(idb, bpy.types.Object):
-                if self._is_published(idb):
+                # Every object reports a shading update whenever the scene's
+                # relations change (e.g. another object is added), so only
+                # geometry counts here; material edits arrive as Material updates.
+                if upd.is_updated_geometry and self._is_published(idb):
                     self._dirty[idb.name] = now
             elif isinstance(idb, (bpy.types.Mesh, bpy.types.Material)):
-                meshes.add(idb)
+                if upd.is_updated_geometry or upd.is_updated_shading:
+                    meshes.add(idb)
         if meshes:
             for obj in self.sync.scene.objects:
                 if self._is_published(obj) and (obj.data in meshes or
@@ -288,24 +363,32 @@ class ModelManager:
             self.sync.log(f"Model '{obj.name}': can't load '{ext or url}' files")
             obj[P_LOADED] = url  # don't retry
             return
+        if not url.startswith(("atp:", "http://", "https://")):
+            obj[P_LOADED] = url
+            return
         self._loading.add(eid)
+        waiting = self._waiting.get(url)
+        if waiting is not None:  # the same model is already on its way
+            waiting.add(eid)
+            return
+        self._waiting[url] = {eid}
+        if _imported_mesh(url) is not None:
+            # Already imported for another entity: share it (applied on the next tick).
+            self._results.put(("loaded", url, ext, None, None))
+            return
         self.in_flight += 1
         if url.startswith("atp:"):
             def done(reply, data):
                 self.in_flight -= 1
-                self._results.put(("loaded", eid, url, ext, data, reply.get("error")))
+                self._results.put(("loaded", url, ext, data, reply.get("error")))
             if not self.connected:
                 done({"error": "no bridge"}, None)
             else:
                 self.session.request({"type": "fetch", "url": url}, done)
-        elif url.startswith(("http://", "https://")):
-            threading.Thread(target=self._download, args=(eid, url, ext), daemon=True).start()
         else:
-            self.in_flight -= 1
-            self._loading.discard(eid)
-            obj[P_LOADED] = url
+            threading.Thread(target=self._download, args=(url, ext), daemon=True).start()
 
-    def _download(self, eid, url, ext) -> None:
+    def _download(self, url, ext) -> None:
         data, err = None, None
         try:
             with urllib.request.urlopen(url, timeout=60) as r:
@@ -315,31 +398,40 @@ class ModelManager:
         except Exception as exc:
             err = str(exc)
         self.in_flight -= 1
-        self._results.put(("loaded", eid, url, ext, data, err))
+        self._results.put(("loaded", url, ext, data, err))
 
-    def _finish_load(self, eid, url, ext, data, err) -> None:
-        self._loading.discard(eid)
-        proxy = self.sync.object_for(eid)
-        if proxy is None:
+    def _finish_load(self, url, ext, data, err) -> None:
+        targets = []
+        for eid in self._waiting.pop(url, ()):
+            self._loading.discard(eid)
+            proxy = self.sync.object_for(eid)
+            # Skip entities whose model changed while this one was on its way.
+            if proxy is not None and str(proxy.get(ss.P_URL, "")) == url:
+                targets.append((eid, proxy))
+        if not targets:
             return
-        if err or not data:
-            self.sync.log(f"Could not load model for '{proxy.name}': {err}")
-            proxy[P_LOADED] = url
-            return
-        try:
-            mesh = import_model(data, ext, f"Overte {proxy.name}")
-        except Exception as exc:
-            self.sync.log(f"Could not import model for '{proxy.name}': {exc}")
-            proxy[P_LOADED] = url
-            return
-        if mesh is None or not mesh.vertices:
-            proxy[P_LOADED] = url
-            return
+        mesh = _imported_mesh(url)
+        if mesh is None:
+            names = ", ".join(f"'{p.name}'" for _e, p in targets)
+            if err or not data:
+                self.sync.log(f"Could not load model for {names}: {err}")
+            else:
+                try:
+                    mesh = import_model(data, ext, f"Overte {_url_name(url)}")
+                except Exception as exc:
+                    self.sync.log(f"Could not import model for {names}: {exc}")
+            if mesh is None or not mesh.vertices:
+                for _eid, proxy in targets:
+                    proxy[P_LOADED] = url  # don't retry
+                return
+            mesh[P_SOURCE] = url
         size, center = _bbox(mesh)
-        self.sync.replace_object_data(proxy, mesh, size, center)
-        obj = self.sync.object_for(eid)
-        if obj is not None:
-            obj[P_LOADED] = url
+        for eid, proxy in targets:
+            if proxy.data != mesh:
+                self.sync.replace_object_data(proxy, mesh, size, center)
+            obj = self.sync.object_for(eid)
+            if obj is not None:
+                obj[P_LOADED] = url
 
     # ------------------------------------------------------------ tick
     def tick(self) -> None:
