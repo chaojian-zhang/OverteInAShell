@@ -39,6 +39,7 @@ P_CENTER = "overte_center"
 P_URL = "overte_model_url"
 P_TEXT = "overte_text"
 P_REG = "overte_registration"   # entity registrationPoint, when not the centre
+P_REPLACES = "overte_replaces"  # entity this object's new entity replaces (deleted once it exists)
 
 NULL_ID = "{00000000-0000-0000-0000-000000000000}"
 DEFAULT_REG = (0.5, 0.5, 0.5)
@@ -159,6 +160,8 @@ class SceneSync:
         self.remote_ids: set[str] = set()
         self.missing_ids: set[str] = set()   # linked in Blender, absent in the domain
         self.pending_adds: dict[str, float] = {}  # tmp id -> time sent
+        self.replaced: dict[str, str] = {}    # entity id -> type, for entities being replaced
+        self._replace_deletes: list[str] = []  # replaced entities to delete on the next tick
         self.synced = False                   # first full snapshot received
         self.stats = {"sent": 0, "received": 0}
         self.on_change = None                 # optional UI refresh callback
@@ -260,7 +263,7 @@ class SceneSync:
         f = {
             "transform": (_vec(t["position"]), cv.json_quat(t["rotation"]), _vec(t["dimensions"])),
             "name": obj.name,
-            "parentID": norm_id(obj.parent.get(P_ID)) if obj.parent is not None and obj.parent.get(P_ID) else NULL_ID,
+            "parentID": _parent_id(obj),
             # Render visibility (camera icon) maps to Overte "visible"; viewport
             # hiding (H) stays a Blender-only working aid.
             "visible": not obj.hide_render,
@@ -368,10 +371,17 @@ class SceneSync:
             props["type"] = etype
             if P_REG in obj:
                 del obj[P_REG]  # new entities use the default (centre)
-            if obj.get(P_SHAPE):
+            if obj.get(P_SHAPE) and etype in PRIMITIVE_TYPES:
                 props["shape"] = obj[P_SHAPE]
             adds.append({"tmp": tmp, "props": props})
             self.pending_adds[tmp] = now
+
+        # Entities replaced by a conversion go once their replacement exists
+        # (after the edits above, which move their children to it).
+        for eid in self._replace_deletes:
+            deletes.append(eid)
+            self.remote_ids.discard(eid)
+        self._replace_deletes = []
 
         out = []
         if edits:
@@ -420,16 +430,18 @@ class SceneSync:
 
     # ------------------------------------------------------ incoming
     def handle_message(self, msg: dict) -> list:
+        """Apply a bridge message; returns messages to send back."""
         t = msg.get("type")
+        out = []
         if t == "changes":
             self._apply_changes(msg)
         elif t == "added":
-            self._on_added(msg)
+            out = self._on_added(msg)
         elif t == "edited":
             self._on_edited(msg)
         if self.on_change:
             self.on_change()
-        return []
+        return out
 
     def _apply_changes(self, msg: dict) -> None:
         upserts = msg.get("upserts") or []
@@ -459,6 +471,8 @@ class SceneSync:
         for props in upserts:
             eid = props["id"]
             self.remote_ids.add(eid)
+            if eid in self.replaced:
+                continue  # its object now stands for the replacement
             self.missing_ids.discard(eid)
             obj = self.object_for(eid)
             rec = self.records.get(eid)
@@ -506,21 +520,33 @@ class SceneSync:
                 rec.obj_name = obj.name
                 rec.local = self.local_fields(obj, rec.type)
 
-    def _on_added(self, msg: dict) -> None:
+    def _on_added(self, msg: dict) -> list:
+        out = []
         for item in msg.get("items") or []:
             tmp = item.get("tmp")
             self.pending_adds.pop(tmp, None)
             obj = next((o for o in self.scene.objects if o.get(P_TMP) == tmp), None)
             if obj is None:
                 continue
+            old = obj.get(P_REPLACES)
             if not item.get("id"):
                 self.log(f"Overte refused to create an entity for '{obj.name}' (no rez permission?)")
                 del obj[P_TMP]
+                if old:
+                    self._abort_replace(obj, old)
+                    out += self.request_resync()  # to rebuild the old entity's record
                 continue
             eid = norm_id(item["id"])
             props = item.get("props") or {}
             del obj[P_TMP]
             obj[P_ID] = eid
+            if old:
+                del obj[P_REPLACES]
+                if P_SHAPE in obj:
+                    del obj[P_SHAPE]
+                self._replace_deletes.append(old)
+                # Overte deletes children with their parent: move them first.
+                self._dirty_names.update(c.name for c in obj.children)
             _store_registration(obj, props)
             etype = props.get("type") or obj.get(P_TYPE, "Box")
             obj[P_TYPE] = etype
@@ -531,6 +557,7 @@ class SceneSync:
             rec.local = dict(fields)
             self.records[eid] = rec
             self.remote_ids.add(eid)
+        return out
 
     def _on_edited(self, msg: dict) -> None:
         for r in msg.get("results") or []:
@@ -678,7 +705,28 @@ class SceneSync:
         if eid:
             self.records.pop(norm_id(eid), None)
             self.missing_ids.discard(norm_id(eid))
-        for k in (P_ID, P_TMP):
+        if obj.get(P_REPLACES):
+            self.replaced.pop(obj[P_REPLACES], None)  # the old entity stays
+        for k in (P_ID, P_TMP, P_REPLACES):
+            if k in obj:
+                del obj[k]
+
+    def begin_replace(self, obj) -> None:
+        """Detach ``obj`` from its entity so it becomes a new one (e.g. a Model of its
+        mesh); the old entity is deleted once the new one exists."""
+        old = norm_id(obj.get(P_ID))
+        rec = self.records.pop(old, None)
+        self.replaced[old] = rec.type if rec else obj.get(P_TYPE, "Box")
+        obj[P_REPLACES] = old
+        del obj[P_ID]
+
+    def _abort_replace(self, obj, old: str) -> None:
+        """The replacement wasn't created: relink ``obj`` to the entity it was replacing."""
+        from .models import P_HASH, P_LOADED
+        del obj[P_REPLACES]
+        obj[P_ID] = old
+        obj[P_TYPE] = self.replaced.pop(old, "Box")
+        for k in (P_URL, P_BASE, P_CENTER, P_LOADED, P_HASH):
             if k in obj:
                 del obj[k]
 
@@ -700,6 +748,15 @@ class SceneSync:
 # ------------------------------------------------------------- helpers
 def new_tmp_id() -> str:
     return str(uuid.uuid4())
+
+
+def _parent_id(obj) -> str:
+    parent = obj.parent
+    if parent is None:
+        return NULL_ID
+    # A parent being converted still is its old entity until the new one exists.
+    eid = parent.get(P_ID) or parent.get(P_REPLACES)
+    return norm_id(eid) if eid else NULL_ID
 
 
 def _store_registration(obj, props: dict) -> None:

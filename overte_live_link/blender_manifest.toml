@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "overte_live_link"
-version = "0.1.0"
+version = "0.2.0"
 name = "Overte Live Link"
 tagline = "Edit an Overte domain's entities live from Blender"
 maintainer = "OverteInAShell contributors"

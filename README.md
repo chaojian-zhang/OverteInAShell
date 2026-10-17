@@ -71,9 +71,14 @@ keeps working across sessions. **New Access Token** revokes it.
 | Model entity | its real geometry, from `atp:` or `http(s):` | both |
 
 * Box, Sphere and Shape entities appear as unit meshes; lights as lights;
-  Model entities as their geometry (`.glb`, `.gltf`, `.fbx`, `.obj`). Other
-  types (Zone, Text, Image, Web, …) appear as cube empties sized to their
+  Model entities as their geometry (`.glb`, `.gltf`, `.fbx`, `.obj`; each
+  model is loaded once and shared by every entity using it). Other types
+  (Zone, Text, Image, Web, …) appear as cube empties sized to their
   dimensions.
+* Overte draws Box, Sphere and Shape entities itself, so editing their mesh
+  in Blender changes nothing in Overte (and, as they share one mesh, changes
+  every primitive of that shape in Blender). Use **Convert to Model** to edit
+  one's mesh.
 * Properties the add-on doesn't map (scripts, userData, zone settings,
   physics, …) are left untouched in Overte.
 * Changes merge per field: if you move an entity in Blender while someone
@@ -95,11 +100,23 @@ permission, which a domain Persistent Script always has.
 
 Selected lights are published as Light entities.
 
+To give a Box, Sphere or Shape entity your own geometry, select it and click
+**Convert to Model** in the panel's *Entity* section. Its mesh is published
+as a Model entity in the same place (with its colour and children), and the
+original entity is deleted once the new one exists. Then edit the mesh like
+any published one.
+
 ### Things to know
 
 * **Deleting in Blender deletes in Overte** (turn off *Sync deletions* to
   prevent it). Opening another .blend file stops the link first, so nothing
   is deleted by accident.
+* **Switching .blend files.** Each .blend has its own access token, so a
+  bridge started with one file's URL can't connect to another file's link.
+  To link a different file, stop the old bridge (Interface: *Edit → Running
+  Scripts*, stop `overte_bridge.js`; domain: remove it from *Persistent
+  Scripts*) and run the new file's URL instead. Only one Blender at a time
+  can listen on a port.
 * **Undoing a deletion** brings the object back, but its entity is gone; the
   panel lists such objects with **Recreate in Overte**.
 * **Entities deleted in Overte** disappear from Blender after about 4 s. An

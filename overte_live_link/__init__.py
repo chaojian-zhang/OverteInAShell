@@ -3,7 +3,7 @@
 bl_info = {  # legacy add-on metadata (Blender < 4.2); 4.2+ reads blender_manifest.toml
     "name": "Overte Live Link",
     "author": "OverteInAShell contributors",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > Overte",
     "description": "Live two-way link between Blender and an Overte domain",

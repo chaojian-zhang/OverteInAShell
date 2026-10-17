@@ -239,6 +239,29 @@ class OVERTE_OT_publish(bpy.types.Operator):
         return {"FINISHED"} if n else {"CANCELLED"}
 
 
+class OVERTE_OT_convert_model(bpy.types.Operator):
+    bl_idname = "overte.convert_model"
+    bl_label = "Convert to Model"
+    bl_description = ("Replace the selected Box, Sphere and Shape entities with Model entities of their "
+                      "meshes, so the mesh can be edited. The original entities are deleted")
+
+    @classmethod
+    def poll(cls, context):
+        from .models import convertible
+        return (runtime.session is not None and runtime.session.bridge_info is not None
+                and any(convertible(o) for o in context.selected_objects))
+
+    def execute(self, context):
+        from .models import convertible
+        objs = [o for o in context.selected_objects if convertible(o)]
+        n, errors = runtime.session.sync.models.convert(objs)
+        for e in errors:
+            self.report({"WARNING"}, e)
+        if n:
+            self.report({"INFO"}, f"Converting {n} object(s)")
+        return {"FINISHED"} if n else {"CANCELLED"}
+
+
 class OVERTE_OT_load_model(bpy.types.Operator):
     bl_idname = "overte.load_model"
     bl_label = "Load Model Geometry"
@@ -420,6 +443,11 @@ class OVERTE_PT_entity(bpy.types.Panel):
             row.operator(OVERTE_OT_load_model.bl_idname, text="Load Model", icon="IMPORT")
             if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
                 row.operator(OVERTE_OT_publish.bl_idname, text="Re-upload", icon="EXPORT")
+        if etype in ss.PRIMITIVE_TYPES and obj.type == "MESH" and obj.get(ss.P_ID):
+            col = layout.column(align=True)
+            col.label(text="Overte draws this shape itself,", icon="INFO")
+            col.label(text="so mesh edits don't sync.")
+            col.operator(OVERTE_OT_convert_model.bl_idname, icon="MESH_DATA")
         layout.prop(obj, "hide_render", text="Hidden in Overte", toggle=False)
         layout.operator(OVERTE_OT_unlink.bl_idname, icon="UNLINKED")
 
@@ -435,7 +463,8 @@ def _object_menu(self, context):
 CLASSES = (
     OverteLinkSettings,
     OVERTE_OT_start, OVERTE_OT_stop, OVERTE_OT_copy_bridge_url, OVERTE_OT_new_token, OVERTE_OT_save_bridge,
-    OVERTE_OT_resync, OVERTE_OT_add_entity, OVERTE_OT_publish, OVERTE_OT_load_model, OVERTE_OT_unlink, OVERTE_OT_recreate_missing,
+    OVERTE_OT_resync, OVERTE_OT_add_entity, OVERTE_OT_publish, OVERTE_OT_convert_model, OVERTE_OT_load_model,
+    OVERTE_OT_unlink, OVERTE_OT_recreate_missing,
     OVERTE_OT_select_missing, OVERTE_MT_add, OVERTE_PT_link, OVERTE_PT_entity,
 )
 
